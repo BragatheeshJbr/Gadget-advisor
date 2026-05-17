@@ -1,6 +1,8 @@
 import os
+import json
 import streamlit as st
 from groq import Groq
+from tavily import TavilyClient
 
 # ── Page configuration ─────────────────────────────────────────
 st.set_page_config(
@@ -9,8 +11,9 @@ st.set_page_config(
     layout="centered"
 )
 
-# ── Connect to Groq ────────────────────────────────────────────
+# ── Connect to Groq and Tavily ─────────────────────────────────
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+tavily = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
 # ── The system prompt ──────────────────────────────────────────
 SYSTEM_PROMPT = """
@@ -47,21 +50,19 @@ If you are unsure about anything, say so clearly
 rather than guessing.
 """
 
-# ── Web search tool definition ─────────────────────────────────
-# This tells Groq what tools the agent is allowed to use
-# The agent reads this and decides when to use web search
+# ── Tool definition — tells Groq what tools exist ─────────────
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current prices, availability and reviews of electronics products on Amazon India and Flipkart",
+            "description": "Search the web for current prices and availability of electronics on Amazon India and Flipkart",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query — e.g. 'Samsung Galaxy Tab S6 Lite price Flipkart 2024'"
+                        "description": "Search query e.g. 'Samsung Galaxy Tab S6 Lite price Flipkart India 2024'"
                     }
                 },
                 "required": ["query"]
@@ -70,15 +71,34 @@ TOOLS = [
     }
 ]
 
+# ── The actual search function — this does the real work ───────
+# This is what runs when the agent decides to search
+# Tavily searches the web and returns clean results
+def web_search(query):
+    try:
+        results = tavily.search(
+            query=query,
+            search_depth="basic",
+            max_results=3
+        )
+        # Pull out just the useful text from results
+        output = ""
+        for r in results.get("results", []):
+            output += f"Source: {r['url']}\n"
+            output += f"Info: {r['content']}\n\n"
+        return output if output else "No results found."
+    except Exception as e:
+        return f"Search failed: {e}"
+
 # ── Page header ────────────────────────────────────────────────
 st.title("🤖 Gadget Advisor")
-st.caption("Your personal tech friend — tells you exactly what to buy, with live prices.")
+st.caption("Your personal tech friend — live prices from Amazon & Flipkart.")
 st.divider()
 
 # ── Session memory ─────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
-    welcome = "Hi! I'm your Gadget Advisor 👋 Tell me what you're looking to buy and I'll find you the right one — with live prices from Amazon and Flipkart!"
+    welcome = "Hi! I'm your Gadget Advisor 👋 Tell me what you're looking to buy and I'll find the right one — with live prices!"
     st.session_state.messages.append({
         "role": "assistant",
         "content": welcome
@@ -94,7 +114,6 @@ user_input = st.chat_input("Tell me what gadget you're looking for...")
 
 if user_input:
 
-    # Show user message
     with st.chat_message("user"):
         st.markdown(user_input)
 
@@ -104,10 +123,9 @@ if user_input:
     })
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching for the best option and live prices..."):
+        with st.spinner("Finding the best option with live prices..."):
             try:
-                # ── First call — agent decides whether to search ───
-                # We pass the tools list so agent knows it CAN search
+                # ── Step 1: Ask Groq what to do ───────────────────
                 response = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=[
@@ -120,42 +138,46 @@ if user_input:
 
                 message = response.choices[0].message
 
-                # ── Check if agent wants to do a web search ────────
-                # tool_calls means the agent decided to search
+                # ── Step 2: If agent wants to search, do it ───────
                 if message.tool_calls:
+                    tool_call = message.tool_calls[0]
 
-                    # Get the search query the agent chose
-                    search_query = message.tool_calls[0].function.arguments
-                    
-                    # Show user we are searching — transparency
-                    st.caption(f"🔍 Searching: {search_query}")
+                    # Get the query the agent chose
+                    args = json.loads(tool_call.function.arguments)
+                    query = args["query"]
 
-                    # ── Second call — send search results back ─────
-                    # Tell Groq to actually execute the search
-                    # and give us the final answer with real data
+                    # Show user what we're searching
+                    st.caption(f"🔍 Searching live: {query}")
+
+                    # Actually run the search using Tavily
+                    search_results = web_search(query)
+
+                    # ── Step 3: Send results back to Groq ─────────
+                    # Now Groq reads the real search results
+                    # and writes the final recommendation
                     final_response = client.chat.completions.create(
                         model="llama-3.3-70b-versatile",
                         messages=[
                             {"role": "system", "content": SYSTEM_PROMPT}
                         ] + st.session_state.messages + [
-                            message,
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": message.tool_calls
+                            },
                             {
                                 "role": "tool",
-                                "tool_call_id": message.tool_calls[0].id,
-                                "content": search_query
+                                "tool_call_id": tool_call.id,
+                                "content": search_results
                             }
                         ],
-                        tools=TOOLS,
-                        tool_choice="none",
                         max_tokens=1024
                     )
 
                     reply = final_response.choices[0].message.content
 
                 else:
-                    # Agent didn't need to search — just answer
-                    # This happens for early questions like
-                    # "what's your budget?" before recommending
+                    # No search needed — just answer directly
                     reply = message.content
 
                 st.markdown(reply)
@@ -166,9 +188,6 @@ if user_input:
                 })
 
             except Exception as e:
-                # ── Friendly error — not a raw technical crash ─────
-                # This is the guardrail we talked about
-                # Users see a human message, not a Python error
                 friendly_msg = "I'm having a little trouble right now — please try again in a moment! 🙏"
                 st.warning(friendly_msg)
                 st.session_state.messages.append({
