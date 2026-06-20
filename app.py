@@ -1,6 +1,9 @@
 import os
+import re
+import json
 import streamlit as st
 from groq import Groq
+from tavily import TavilyClient
 
 # ── Page configuration ─────────────────────────────────────────
 st.set_page_config(
@@ -9,109 +12,139 @@ st.set_page_config(
     layout="centered"
 )
 
-# ── Connect to Groq ────────────────────────────────────────────
+# ── Connect to Groq and Tavily ─────────────────────────────────
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+tavily = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
 # ── System prompt ──────────────────────────────────────────────
-SYSTEM_PROMPT = """
-You are a friendly gadget buying advisor for non-technical people.
+SYSTEM_PROMPT = """You are a friendly gadget buying advisor for non-technical people.
 
-FOLLOW THESE STEPS STRICTLY:
-
-STEP 1 - Ask BOTH these questions together in one message:
-- "What will you use it for most?"
-- "Any brand preference?"
-
-STEP 2 - Only AFTER they answer, search and recommend.
-
-STEP 3 - Give ONE product. Plain English. No jargon.
-Say the price and where to buy (Amazon/Flipkart).
-
-EXAMPLE:
-User: "I want a phone under 15000"
-You: "Great! Two quick questions:
-1. What will you use it for — calls, camera, or social media?
-2. Any brand preference like Samsung or Redmi?"
-User: "Camera and calls. No preference."
-You: [search then recommend ONE product with price]
+STEPS:
+1. If you don't know their use case or brand preference — ask both in ONE message.
+2. Once you have budget + use case — use web_search to find price then recommend ONE product.
 
 RULES:
-- NEVER recommend before asking Step 1 questions
-- NEVER exceed user's budget
-- NEVER use tech jargon — explain in simple words
-- NEVER recommend outside electronics/gadgets
-- NEVER guess prices — always search first
-- Always explain why this product fits their life
-- Keep responses concise and to the point
-"""
+- Never recommend before understanding their need
+- Never exceed their budget
+- No tech jargon — plain English only
+- Never go outside electronics topic
+- Always search for live price before recommending
+- Keep replies short and clear
+- One recommendation only — not a list"""
 
-# ── Smart message trimmer ──────────────────────────────────────
-# This is the key function that prevents 413 errors
-# It keeps trimming history until the request fits
-# Think of it like a smart suitcase that fits everything in
-def get_safe_messages(messages, max_messages=4):
-    # Start with last 4 messages
-    # If that's still too big, try 2
-    # If that's still too big, try just the last 1
-    # This way we never crash — we always send something
-    for count in [max_messages, 2, 1]:
-        recent = messages[-count:] if len(messages) >= count else messages
-        # Rough token estimate — each word is about 1.3 tokens
-        # System prompt + messages should stay under 3000 tokens
-        total_chars = len(SYSTEM_PROMPT)
-        for m in recent:
-            total_chars += len(m.get("content", ""))
-        # 3000 tokens ≈ 12000 characters — safe limit for compound-beta
-        if total_chars < 12000:
-            return recent
-    # Absolute fallback — just the last message
-    return messages[-1:]
+# ── Tool definition ────────────────────────────────────────────
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search for current prices of electronics on Amazon India and Flipkart. Use only when ready to recommend.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query e.g. 'Samsung phone under 20000 Flipkart India 2024'"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
 
-# ── Friendly messages for every error type ─────────────────────
-# Users never see technical errors — only human messages
-def get_friendly_error(error_str):
-    error_str = error_str.lower()
+# ── Real web search via Tavily ─────────────────────────────────
+def web_search(query):
+    try:
+        results = tavily.search(
+            query=query,
+            search_depth="basic",
+            max_results=3
+        )
+        output = ""
+        for r in results.get("results", []):
+            output += f"Source: {r['url']}\n"
+            output += f"Info: {r['content']}\n\n"
+        return output if output else "No results found."
+    except Exception as e:
+        return f"Search failed: {e}"
 
-    if "413" in error_str or "too large" in error_str:
-        return "Let me start fresh to give you a better answer. What gadget are you looking for and what's your budget?"
+# ── Context extraction ─────────────────────────────────────────
+# Pulls key facts out of each message
+# Keeps request size tiny — prevents 413 permanently
+def extract_context(user_message):
+    msg = user_message.lower()
 
-    elif "429" in error_str or "rate limit" in error_str:
-        return "I'm helping a lot of people right now — please try again in about 30 seconds! 😊"
+    budget_match = re.search(r'(\d[\d,]*)\s*(?:rupees|rs|₹|inr)?', msg)
+    if budget_match and not st.session_state.context["budget"]:
+        amount = budget_match.group(1).replace(",", "")
+        if int(amount) > 1000:
+            st.session_state.context["budget"] = f"₹{amount}"
 
-    elif "401" in error_str or "api_key" in error_str:
-        return "I'm having a technical issue on my end. Please try again in a moment."
+    gadgets = ["phone", "mobile", "tablet", "laptop", "earphone",
+               "earbuds", "tv", "television", "camera", "watch",
+               "smartwatch", "speaker", "headphone"]
+    for g in gadgets:
+        if g in msg and not st.session_state.context["gadget"]:
+            st.session_state.context["gadget"] = g
+            break
 
-    elif "400" in error_str or "tool_use_failed" in error_str:
-        return "I had trouble searching for that. Could you rephrase your request? For example: 'I want a phone under ₹15,000 for calling and camera.'"
+    uses = ["camera", "calls", "gaming", "study", "work", "music",
+            "video", "social media", "photos", "teaching", "reading"]
+    found_uses = [u for u in uses if u in msg]
+    if found_uses and not st.session_state.context["use_case"]:
+        st.session_state.context["use_case"] = ", ".join(found_uses)
 
-    elif "503" in error_str or "unavailable" in error_str:
-        return "The service is temporarily busy. Please try again in a minute! 🙏"
+    brands = ["samsung", "redmi", "xiaomi", "realme", "oppo", "vivo",
+              "oneplus", "apple", "nokia", "motorola", "poco"]
+    for b in brands:
+        if b in msg and not st.session_state.context["brand"]:
+            st.session_state.context["brand"] = b
+            break
+    if any(x in msg for x in ["no preference", "any brand", "no brand", "anything"]):
+        st.session_state.context["brand"] = "no preference"
 
-    else:
-        return "Something went wrong on my end. Please try again — and if it keeps happening, try refreshing the page."
+# ── Build context summary ──────────────────────────────────────
+def build_context_message():
+    ctx = st.session_state.context
+    parts = []
+    if ctx["gadget"]: parts.append(f"Gadget: {ctx['gadget']}")
+    if ctx["budget"]: parts.append(f"Budget: {ctx['budget']}")
+    if ctx["use_case"]: parts.append(f"Use case: {ctx['use_case']}")
+    if ctx["brand"]: parts.append(f"Brand: {ctx['brand']}")
+    if parts:
+        return "User info collected so far: " + " | ".join(parts)
+    return ""
 
 # ── Page header ────────────────────────────────────────────────
 st.title("🤖 Gadget Advisor")
 st.caption("Your personal tech friend — live prices from Amazon & Flipkart.")
 st.divider()
 
-# ── Session memory ─────────────────────────────────────────────
+# ── Session state setup ────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
+    st.session_state.context = {
+        "gadget": None, "budget": None,
+        "use_case": None, "brand": None
+    }
     welcome = "Hi! I'm your Gadget Advisor 👋 Tell me what gadget you're looking for and your budget — I'll find the perfect one for you!"
     st.session_state.messages.append({
-        "role": "assistant",
-        "content": welcome
+        "role": "assistant", "content": welcome
     })
 
-# ── Reset button — gives user a clean start ────────────────────
-# This is a soft kill switch — clears everything and starts over
-if len(st.session_state.messages) > 6:
-    if st.button("🔄 Start new search"):
+# ── Reset button ───────────────────────────────────────────────
+col1, col2 = st.columns([4, 1])
+with col2:
+    if st.button("🔄 Reset"):
         st.session_state.messages = []
+        st.session_state.context = {
+            "gadget": None, "budget": None,
+            "use_case": None, "brand": None
+        }
         st.rerun()
 
-# ── Display conversation history ───────────────────────────────
+# ── Display conversation ───────────────────────────────────────
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -121,73 +154,109 @@ user_input = st.chat_input("Tell me what gadget you're looking for...")
 
 if user_input:
 
+    extract_context(user_input)
+
     with st.chat_message("user"):
         st.markdown(user_input)
 
     st.session_state.messages.append({
-        "role": "user",
-        "content": user_input
+        "role": "user", "content": user_input
     })
 
     with st.chat_message("assistant"):
         with st.spinner("Finding the best option..."):
             try:
-                # Get safe trimmed history — never too large
-                safe_messages = get_safe_messages(st.session_state.messages)
+                # Build messages — system prompt + context + last 2 messages
+                # Keeps request size small — no 413 ever
+                context_summary = build_context_message()
+                recent = st.session_state.messages[-2:]
 
+                messages_to_send = [
+                    {"role": "system", "content": SYSTEM_PROMPT}
+                ]
+                if context_summary:
+                    messages_to_send.append({
+                        "role": "system", "content": context_summary
+                    })
+                messages_to_send.extend(recent)
+
+                # ── First call — does agent want to search? ────────
                 response = client.chat.completions.create(
-                    model="compound-beta",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT}
-                    ] + safe_messages,
-                    max_tokens=512
+                    model="llama-3.3-70b-versatile",
+                    messages=messages_to_send,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    max_tokens=400
                 )
 
-                reply = response.choices[0].message.content
+                message_obj = response.choices[0].message
 
-                # Show search indicator if web was used
-                if hasattr(response.choices[0].message, 'executed_tools'):
-                    tools_used = response.choices[0].message.executed_tools
-                    if tools_used:
-                        st.caption("🔍 Searched live web for current prices")
+                # ── If agent wants to search ───────────────────────
+                if message_obj.tool_calls:
+                    tool_call = message_obj.tool_calls[0]
+
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                        query = args.get("query", "")
+                    except Exception:
+                        query = ""
+
+                    if query:
+                        st.caption(f"🔍 Searching: {query}")
+                        search_results = web_search(query)
+
+                        # ── Second call with search results ────────
+                        final_response = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=messages_to_send + [
+                                {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": tool_call.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_call.function.name,
+                                                "arguments": tool_call.function.arguments
+                                            }
+                                        }
+                                    ]
+                                },
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": search_results
+                                }
+                            ],
+                            max_tokens=400
+                        )
+                        reply = final_response.choices[0].message.content
+                    else:
+                        reply = message_obj.content or "Could you tell me more about what you need?"
+
+                else:
+                    # No search needed — direct answer
+                    reply = message_obj.content or "Could you tell me more about what you need?"
 
                 st.markdown(reply)
                 st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": reply
+                    "role": "assistant", "content": reply
                 })
 
             except Exception as e:
-                # ── Never show raw error to user ───────────────────
-                # Get the friendly version of whatever went wrong
-                friendly = get_friendly_error(str(e))
-                st.markdown(friendly)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": friendly
-                })
+                error_str = str(e).lower()
 
-                # ── Auto recovery for 413 errors ───────────────────
-                # If request was too large, trim history automatically
-                # and retry once — user never knows this happened
-                if "413" in str(e) or "too large" in str(e).lower():
-                    try:
-                        # Retry with just 1 message
-                        retry_response = client.chat.completions.create(
-                            model="compound-beta",
-                            messages=[
-                                {"role": "system", "content": SYSTEM_PROMPT},
-                                st.session_state.messages[-1]
-                            ],
-                            max_tokens=512
-                        )
-                        retry_reply = retry_response.choices[0].message.content
-                        # Replace the error message with actual reply
-                        st.session_state.messages[-1] = {
-                            "role": "assistant",
-                            "content": retry_reply
-                        }
-                        st.rerun()
-                    except Exception:
-                        # Retry also failed — friendly message stays
-                        pass
+                if "429" in error_str or "rate limit" in error_str:
+                    msg = "I'm helping a lot of people right now — please try again in 30 seconds! 😊"
+                elif "401" in error_str:
+                    msg = "I'm having a technical issue. Please try again in a moment."
+                elif "503" in error_str:
+                    msg = "Service is temporarily busy. Please try again! 🙏"
+                else:
+                    msg = "Something went wrong. Please try again or click Reset to start fresh."
+
+                st.markdown(msg)
+                st.session_state.messages.append({
+                    "role": "assistant", "content": msg
+                })
