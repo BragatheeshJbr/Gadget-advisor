@@ -77,14 +77,19 @@ if user_input:
             try:
                 # ── Single API call with Groq built-in web search ──
                 # No Tavily needed — Groq searches natively
+                # Keep only last 6 messages to avoid context limit
+                # 6 messages = 3 back and forth exchanges — enough
+                # for a complete gadget recommendation conversation
+                recent_messages = st.session_state.messages[-6:]
+
                 response = client.chat.completions.create(
                     model="compound-beta",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT}
-                    ] + st.session_state.messages,
+                    ] + recent_messages,
                     max_tokens=1024
                 )
-
+                
                 reply = response.choices[0].message.content
 
                 # ── Show if web search was used ────────────────────
