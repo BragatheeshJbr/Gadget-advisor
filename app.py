@@ -1,8 +1,6 @@
 import os
-import json
 import streamlit as st
 from groq import Groq
-from tavily import TavilyClient
 
 # ── Page configuration ─────────────────────────────────────────
 st.set_page_config(
@@ -11,9 +9,8 @@ st.set_page_config(
     layout="centered"
 )
 
-# ── Connect to Groq and Tavily ─────────────────────────────────
+# ── Connect to Groq ────────────────────────────────────────────
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-tavily = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
 # ── The system prompt ──────────────────────────────────────────
 SYSTEM_PROMPT = """
@@ -22,22 +19,18 @@ You help non-technical people — like doctors, teachers,
 bank employees, and homemakers — buy the right
 electronics and gadgets for their specific needs.
 
-STRICT CONVERSATION RULES:
-- First message: ONLY ask what they want to buy if not clear.
-- Ask ALL your questions in ONE single message — not one by one.
-- Ask maximum 2 questions at once. Never more.
-- ONLY search the web AFTER you have collected all the 
-  information you need to make a recommendation.
-- Never search in the middle of asking questions.
-- Once you have enough information, search ONCE and recommend.
+CONVERSATION RULES:
+- Ask maximum 2 questions in one message before recommending.
+- Never ask questions one by one — ask both together.
+- Only recommend AFTER you have budget, use case, and preferences.
+- Always search for live prices before giving a recommendation.
 
 ALWAYS do this:
 - Ask 2 questions maximum before recommending.
 - Give ONE specific product recommendation, not a list.
 - Explain in plain English — no tech jargon ever.
 - Always say why this product fits their specific life.
-- Search for the current price before mentioning it.
-- Tell them exactly where to buy with the price you found.
+- Always mention current price and where to buy it.
 
 NEVER do this:
 - Never recommend outside the user's stated budget.
@@ -45,49 +38,7 @@ NEVER do this:
 - Never recommend a product you are not confident exists.
 - Never answer questions outside electronics and gadgets.
 - Never make the user feel stupid for not knowing specs.
-- Never show raw search queries or function calls to the user.
-- Never search before you have enough information to recommend.
-
-If you are unsure about anything, say so clearly
-rather than guessing.
 """
-
-# ── Tool definition ────────────────────────────────────────────
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search for current prices and availability of electronics on Amazon India and Flipkart. Only use this when you are ready to make a final recommendation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Specific search query e.g. 'Oppo A17 price Flipkart India 2024'"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    }
-]
-
-# ── Real web search function ───────────────────────────────────
-def web_search(query):
-    try:
-        results = tavily.search(
-            query=query,
-            search_depth="basic",
-            max_results=3
-        )
-        output = ""
-        for r in results.get("results", []):
-            output += f"Source: {r['url']}\n"
-            output += f"Info: {r['content']}\n\n"
-        return output if output else "No results found."
-    except Exception as e:
-        return f"Search failed: {e}"
 
 # ── Page header ────────────────────────────────────────────────
 st.title("🤖 Gadget Advisor")
@@ -122,86 +73,31 @@ if user_input:
     })
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
+        with st.spinner("Finding the best option with live prices..."):
             try:
-                # ── Step 1: First call to Groq ─────────────────────
+                # ── Single API call with Groq built-in web search ──
+                # No Tavily needed — Groq searches natively
                 response = client.chat.completions.create(
-                    model="llama3-groq-70b-8192-tool-use-preview",
+                    model="compound-beta",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT}
                     ] + st.session_state.messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
                     max_tokens=1024
                 )
 
-                message_obj = response.choices[0].message
+                reply = response.choices[0].message.content
 
-                # ── Step 2: Check if agent wants to search ─────────
-                if message_obj.tool_calls:
+                # ── Show if web search was used ────────────────────
+                if hasattr(response.choices[0].message, 'executed_tools'):
+                    tools_used = response.choices[0].message.executed_tools
+                    if tools_used:
+                        st.caption("🔍 Searched live web for current prices")
 
-                    tool_call = message_obj.tool_calls[0]
-
-                    # Safely parse the arguments
-                    try:
-                        args = json.loads(tool_call.function.arguments)
-                        query = args.get("query", "")
-                    except Exception:
-                        query = ""
-
-                    if query:
-                        # Show searching indicator
-                        st.caption(f"🔍 Searching: {query}")
-
-                        # Run the actual search
-                        search_results = web_search(query)
-
-                        # ── Step 3: Send results back to Groq ─────
-                        final_response = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
-                            messages=[
-                                {"role": "system", "content": SYSTEM_PROMPT}
-                            ] + st.session_state.messages + [
-                                {
-                                    "role": "assistant",
-                                    "content": None,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_call.function.name,
-                                                "arguments": tool_call.function.arguments
-                                            }
-                                        }
-                                    ]
-                                },
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "content": search_results
-                                }
-                            ],
-                            max_tokens=1024
-                        )
-
-                        reply = final_response.choices[0].message.content
-
-                    else:
-                        # Query was empty — just answer directly
-                        reply = message_obj.content or "Could you tell me more about what you're looking for?"
-
-                else:
-                    # No search needed — agent answers directly
-                    reply = message_obj.content or "Could you tell me more about what you're looking for?"
-
-                # ── Step 4: Show reply and save to history ─────────
-                if reply:
-                    st.markdown(reply)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": reply
-                    })
+                st.markdown(reply)
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": reply
+                })
 
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
