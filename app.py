@@ -22,47 +22,49 @@ You help non-technical people — like doctors, teachers,
 bank employees, and homemakers — buy the right
 electronics and gadgets for their specific needs.
 
-You have access to web search. Use it to find:
-- Current prices on Amazon India and Flipkart
-- Whether a product is currently available
-- Recent reviews from the last 6 months
+STRICT CONVERSATION RULES:
+- First message: ONLY ask what they want to buy if not clear.
+- Ask ALL your questions in ONE single message — not one by one.
+- Ask maximum 2 questions at once. Never more.
+- ONLY search the web AFTER you have collected all the 
+  information you need to make a recommendation.
+- Never search in the middle of asking questions.
+- Once you have enough information, search ONCE and recommend.
 
 ALWAYS do this:
-- Ask 2-3 short questions before recommending.
+- Ask 2 questions maximum before recommending.
 - Give ONE specific product recommendation, not a list.
 - Explain in plain English — no tech jargon ever.
 - Always say why this product fits their specific life.
 - Search for the current price before mentioning it.
-- Tell them exactly where to buy it with the price
-  you found — Amazon or Flipkart.
+- Tell them exactly where to buy with the price you found.
 
 NEVER do this:
 - Never recommend outside the user's stated budget.
 - Never guess a price — always search for it first.
-- Never recommend a product you are not confident
-  exists. Say 'I am not sure' instead.
-- Never answer questions outside electronics and
-  gadgets. Politely redirect.
-- Never make the user feel stupid for not knowing
-  technical specs.
+- Never recommend a product you are not confident exists.
+- Never answer questions outside electronics and gadgets.
+- Never make the user feel stupid for not knowing specs.
+- Never show raw search queries or function calls to the user.
+- Never search before you have enough information to recommend.
 
 If you are unsure about anything, say so clearly
 rather than guessing.
 """
 
-# ── Tool definition — tells Groq what tools exist ─────────────
+# ── Tool definition ────────────────────────────────────────────
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web for current prices and availability of electronics on Amazon India and Flipkart",
+            "description": "Search for current prices and availability of electronics on Amazon India and Flipkart. Only use this when you are ready to make a final recommendation.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query e.g. 'Samsung Galaxy Tab S6 Lite price Flipkart India 2024'"
+                        "description": "Specific search query e.g. 'Oppo A17 price Flipkart India 2024'"
                     }
                 },
                 "required": ["query"]
@@ -71,9 +73,7 @@ TOOLS = [
     }
 ]
 
-# ── The actual search function — this does the real work ───────
-# This is what runs when the agent decides to search
-# Tavily searches the web and returns clean results
+# ── Real web search function ───────────────────────────────────
 def web_search(query):
     try:
         results = tavily.search(
@@ -81,7 +81,6 @@ def web_search(query):
             search_depth="basic",
             max_results=3
         )
-        # Pull out just the useful text from results
         output = ""
         for r in results.get("results", []):
             output += f"Source: {r['url']}\n"
@@ -123,9 +122,9 @@ if user_input:
     })
 
     with st.chat_message("assistant"):
-        with st.spinner("Finding the best option with live prices..."):
+        with st.spinner("Thinking..."):
             try:
-                # ── Step 1: Ask Groq what to do ───────────────────
+                # ── Step 1: First call to Groq ─────────────────────
                 response = client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=[
@@ -136,61 +135,78 @@ if user_input:
                     max_tokens=1024
                 )
 
-                message = response.choices[0].message
+                message_obj = response.choices[0].message
 
-                # ── Step 2: If agent wants to search, do it ───────
-                if message.tool_calls:
-                    tool_call = message.tool_calls[0]
+                # ── Step 2: Check if agent wants to search ─────────
+                if message_obj.tool_calls:
 
-                    # Get the query the agent chose
-                    args = json.loads(tool_call.function.arguments)
-                    query = args["query"]
+                    tool_call = message_obj.tool_calls[0]
 
-                    # Show user what we're searching
-                    st.caption(f"🔍 Searching live: {query}")
+                    # Safely parse the arguments
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                        query = args.get("query", "")
+                    except Exception:
+                        query = ""
 
-                    # Actually run the search using Tavily
-                    search_results = web_search(query)
+                    if query:
+                        # Show searching indicator
+                        st.caption(f"🔍 Searching: {query}")
 
-                    # ── Step 3: Send results back to Groq ─────────
-                    # Now Groq reads the real search results
-                    # and writes the final recommendation
-                    final_response = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
-                        messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT}
-                        ] + st.session_state.messages + [
-                            {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": message.tool_calls
-                            },
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": search_results
-                            }
-                        ],
-                        max_tokens=1024
-                    )
+                        # Run the actual search
+                        search_results = web_search(query)
 
-                    reply = final_response.choices[0].message.content
+                        # ── Step 3: Send results back to Groq ─────
+                        final_response = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=[
+                                {"role": "system", "content": SYSTEM_PROMPT}
+                            ] + st.session_state.messages + [
+                                {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": tool_call.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_call.function.name,
+                                                "arguments": tool_call.function.arguments
+                                            }
+                                        }
+                                    ]
+                                },
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": search_results
+                                }
+                            ],
+                            max_tokens=1024
+                        )
+
+                        reply = final_response.choices[0].message.content
+
+                    else:
+                        # Query was empty — just answer directly
+                        reply = message_obj.content or "Could you tell me more about what you're looking for?"
 
                 else:
-                    # No search needed — just answer directly
-                    reply = message.content
+                    # No search needed — agent answers directly
+                    reply = message_obj.content or "Could you tell me more about what you're looking for?"
 
-                st.markdown(reply)
-
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": reply
-                })
+                # ── Step 4: Show reply and save to history ─────────
+                if reply:
+                    st.markdown(reply)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": reply
+                    })
 
             except Exception as e:
-                friendly_msg = "I'm having a little trouble right now — please try again in a moment! 🙏"
-                st.warning(friendly_msg)
+                error_msg = f"Error: {str(e)}"
+                st.error(error_msg)
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": friendly_msg
+                    "content": error_msg
                 })
