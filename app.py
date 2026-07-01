@@ -182,7 +182,7 @@ if user_input:
 
                 # ── First call — does agent want to search? ────────
                 response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="qwen/qwen3.6-27b",
                     messages=messages_to_send,
                     tools=TOOLS,
                     tool_choice="auto",
@@ -207,7 +207,7 @@ if user_input:
 
                         # ── Second call with search results ────────
                         final_response = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
+                            model="qwen/qwen3.6-27b",
                             messages=messages_to_send + [
                                 {
                                     "role": "assistant",
