@@ -182,7 +182,7 @@ if user_input:
 
                 # ── First call — does agent want to search? ────────
                 response = client.chat.completions.create(
-                    model="qwen/qwen3.6-27b",
+                    model="openai/gpt-oss-120b",
                     messages=messages_to_send,
                     tools=TOOLS,
                     tool_choice="auto",
@@ -207,7 +207,7 @@ if user_input:
 
                         # ── Second call with search results ────────
                         final_response = client.chat.completions.create(
-                            model="qwen/qwen3.6-27b",
+                            model="openai/gpt-oss-120b",
                             messages=messages_to_send + [
                                 {
                                     "role": "assistant",
